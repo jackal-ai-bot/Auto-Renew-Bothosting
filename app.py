@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, base64, socket, atexit, tempfile, requests, subprocess
+import os, re, sys, time, requests, subprocess
 from datetime import datetime
 from seleniumbase import SB
 
@@ -15,11 +15,6 @@ TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""           # TG bot token
 if not SESSION_TOKEN :
     print("ℹ️ 未配置 SESSION_TOKEN,脚本终止。")
     sys.exit(1)
-
-# vmess 相关配置
-VMESS_URL      = os.environ.get("VMESS_URL") or ""             # vmess:// 节点链接，填写后自动启用代理
-XRAY_BIN       = os.environ.get("XRAY_BIN") or "xray"          # xray-core 可执行文件路径，默认PATH中的xray
-LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT") or 10808)  # 本地SOCKS5端口
 
 # 构造cookie
 COOKIES = {
@@ -138,122 +133,6 @@ def get_current_ip(proxy_server: str = "") -> str:
     response.raise_for_status()
     return response.text.strip()
 
-# 解析 vmess:// 链接
-def parse_vmess_url(vmess_url: str) -> dict:
-    if not vmess_url.startswith("vmess://"):
-        raise ValueError("不是合法的 vmess:// 链接")
-    b64 = vmess_url[len("vmess://"):]
-    b64 += "=" * (-len(b64) % 4)  # 补齐base64 padding
-    raw = base64.urlsafe_b64decode(b64.encode()) if any(c in b64 for c in "-_") else base64.b64decode(b64.encode())
-    data = json.loads(raw.decode("utf-8"))
-    return data
-
-# 生成 xray 配置文件（本地 SOCKS5 入站 + vmess 出站）
-def build_xray_config(vmess: dict, local_port: int) -> dict:
-    net = (vmess.get("net") or "tcp").lower()
-    tls = (vmess.get("tls") or "").lower()
-
-    stream_settings = {"network": net}
-    if tls == "tls":
-        stream_settings["security"] = "tls"
-        stream_settings["tlsSettings"] = {
-            "serverName": vmess.get("sni") or vmess.get("host") or vmess.get("add", "")
-        }
-
-    if net == "ws":
-        stream_settings["wsSettings"] = {
-            "path": vmess.get("path") or "/",
-            "headers": {"Host": vmess.get("host") or vmess.get("add", "")}
-        }
-    elif net == "grpc":
-        stream_settings["grpcSettings"] = {
-            "serviceName": vmess.get("path") or ""
-        }
-    elif net == "h2":
-        stream_settings["httpSettings"] = {
-            "path": vmess.get("path") or "/",
-            "host": [vmess.get("host") or vmess.get("add", "")]
-        }
-
-    config = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": local_port,
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True},
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
-        }],
-        "outbounds": [{
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": vmess.get("add"),
-                    "port": int(vmess.get("port")),
-                    "users": [{
-                        "id": vmess.get("id"),
-                        "alterId": int(vmess.get("aid") or 0),
-                        "security": vmess.get("scy") or "auto"
-                    }]
-                }]
-            },
-            "streamSettings": stream_settings
-        }]
-    }
-    return config
-
-# 启动本地 xray 代理进程，返回 (进程对象, 本地代理地址)
-def start_xray_proxy(vmess_url: str, local_port: int, xray_bin: str = "xray"):
-    vmess = parse_vmess_url(vmess_url)
-    config = build_xray_config(vmess, local_port)
-
-    cfg_fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix="xray_cfg_")
-    with os.fdopen(cfg_fd, "w", encoding="utf-8") as f:
-        json.dump(config, f)
-
-    print(f"🔌 启动 xray-core，节点: {vmess.get('add')}:{vmess.get('port')}，本地端口: {local_port}")
-    try:
-        proc = subprocess.Popen(
-            [xray_bin, "run", "-c", cfg_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"未找到 xray 可执行文件: {xray_bin}，请检查 XRAY_BIN 或安装 xray-core")
-
-    # 等待本地端口可连接，最多10秒
-    for _ in range(20):
-        try:
-            with socket.create_connection(("127.0.0.1", local_port), timeout=0.5):
-                print("✅ xray 本地代理端口已就绪")
-                break
-        except OSError:
-            time.sleep(0.5)
-    else:
-        stderr_output = ""
-        try:
-            proc.terminate()
-            _, stderr_output = proc.communicate(timeout=3)
-        except Exception:
-            pass
-        raise RuntimeError(f"xray 启动超时，未监听端口 {local_port}。错误输出: {stderr_output}")
-
-    def _cleanup():
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            os.remove(cfg_path)
-        except Exception:
-            pass
-
-    atexit.register(_cleanup)
-    return proc, f"socks5://127.0.0.1:{local_port}"
-
 # 时间格式化
 def format_countdown(countdown_str: str) -> str:
     try:
@@ -297,17 +176,6 @@ def main():
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
-
-    xray_proc = None
-    if VMESS_URL:
-        # 优先使用 vmess 节点：本地拉起 xray 作为 SOCKS5 代理
-        try:
-            xray_proc, PROXY_SERVER = start_xray_proxy(VMESS_URL, LOCAL_PROXY_PORT, XRAY_BIN)
-            IS_PROXY = True
-        except Exception as e:
-            print(f"❌ vmess 代理启动失败: {e}")
-            send_telegram_message(format_notification("❌ 续期失败", error=f"vmess 代理启动失败: {e}"))
-            return
 
     sb_kwargs = {"uc": True, "headless": HEADLESS}
 
