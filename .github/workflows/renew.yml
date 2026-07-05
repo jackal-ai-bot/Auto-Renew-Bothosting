@@ -2,7 +2,7 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '0 10 * * *'  # UTC 10点 (北京时间18点)
+    - cron: '0 8 * * *'  # UTC 10点 (北京时间18点)
     - cron: '0 16 * * *'  # UTC 16点 (北京时间0点)
   workflow_dispatch:
 
